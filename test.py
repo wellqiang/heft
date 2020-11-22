@@ -14,7 +14,7 @@ import networkx as nx
 
 logger = logging.getLogger('heft')
 
-ScheduleEvent = namedtuple('ScheduleEvent', 'task start end proc')
+ScheduleEvent = namedtuple('ScheduleEvent', 'task start end proc wf_id')
 
 """
 Default computation matrix - taken from Topcuoglu 2002 HEFT paper
@@ -101,12 +101,14 @@ def schedule_dag(dag, computation_matrix=W0, communication_matrix=C0, communicat
         for schedule_event in proc_schedules[proc]:
             _self.task_schedules[schedule_event.task] = schedule_event
 
-    # Nodes with no successors cause the any expression to be empty    
-    root_node = [node for node in dag.nodes() if not any(True for _ in dag.predecessors(node))]
+    # Nodes with no successors cause the any expression to be empty  
+    # 找到entry node  
+    root_node = [node for node in dag.nodes() if not any(True for _ in dag.predecessors(node))] # 没有任何前驱节点
     assert len(root_node) == 1, f"Expected a single root node, found {len(root_node)}"
     root_node = root_node[0]
     _self.root_node = root_node
-
+ 
+    # 计算向上排序值
     logger.debug(""); logger.debug("====================== Performing Rank-U Computation ======================\n"); logger.debug("")
     _compute_ranku(_self, dag, metric=rank_metric, **kwargs)
 
@@ -116,10 +118,15 @@ def schedule_dag(dag, computation_matrix=W0, communication_matrix=C0, communicat
         logger.debug("Root node was not the first node in the sorted list. Must be a zero-cost and zero-weight placeholder node. Rearranging it so it is scheduled first\n")
         idx = sorted_nodes.index(root_node)
         sorted_nodes[idx], sorted_nodes[0] = sorted_nodes[0], sorted_nodes[idx]
+
+
+
+    # 按照顺序为每个node分配处理器
     for node in sorted_nodes:
         if _self.task_schedules[node] is not None:
             continue
-        minTaskSchedule = ScheduleEvent(node, inf, inf, -1)
+        wf_id = computation_matrix[node - _self.numExistingJobs][-1]
+        minTaskSchedule = ScheduleEvent(node, inf, inf, -1, 0)
         minEDP = inf
         op_mode = kwargs.get("op_mode", OpMode.EFT)
         if op_mode == OpMode.EDP_ABS:
@@ -128,7 +135,7 @@ def schedule_dag(dag, computation_matrix=W0, communication_matrix=C0, communicat
             minScheduleStart = inf
 
             for proc in range(len(communication_matrix)):
-                taskschedule = _compute_eft(_self, dag, node, proc)
+                taskschedule = _compute_eft(_self, dag, node, proc, wf_id)
                 edp_t = ((taskschedule.end - taskschedule.start)**2) * kwargs["power_dict"][node][proc]
                 if (edp_t < minEDP):
                     minEDP = edp_t
@@ -142,7 +149,7 @@ def schedule_dag(dag, computation_matrix=W0, communication_matrix=C0, communicat
             minScheduleStart = inf
 
             for proc in range(len(communication_matrix)):
-                taskschedules.append(_compute_eft(_self, dag, node, proc))
+                taskschedules.append(_compute_eft(_self, dag, node, proc, wf_id))
                 if taskschedules[proc].start < minScheduleStart:
                     minScheduleStart = taskschedules[proc].start
 
@@ -158,15 +165,18 @@ def schedule_dag(dag, computation_matrix=W0, communication_matrix=C0, communicat
         elif op_mode == OpMode.ENERGY:
             assert False, "Feature not implemented"
             assert "power_dict" in kwargs, "In order to perform Energy-based processor assignment, a power_dict is required"
-        
-        else:
+        # EFT
+        else: 
             for proc in range(len(communication_matrix)):
-                taskschedule = _compute_eft(_self, dag, node, proc)
+                taskschedule = _compute_eft(_self, dag, node, proc, wf_id)
                 if (taskschedule.end < minTaskSchedule.end):
                     minTaskSchedule = taskschedule
         
+        # 为节点分配最优处理器
         _self.task_schedules[node] = minTaskSchedule
+        # 相应处理器的相应时间段被占用
         _self.proc_schedules[minTaskSchedule.proc].append(minTaskSchedule)
+        # 已经被使用的时间段排序
         _self.proc_schedules[minTaskSchedule.proc] = sorted(_self.proc_schedules[minTaskSchedule.proc], key=lambda schedule_event: (schedule_event.end, schedule_event.start))
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug('\n')
@@ -174,13 +184,14 @@ def schedule_dag(dag, computation_matrix=W0, communication_matrix=C0, communicat
                 logger.debug(f"Processor {proc} has the following jobs:")
                 logger.debug(f"\t{jobs}")
             logger.debug('\n')
+        # 保证相同处理器的前一个任务结束时间大于下一个任务的开始时间
         for proc in range(len(_self.proc_schedules)):
             for job in range(len(_self.proc_schedules[proc])-1):
                 first_job = _self.proc_schedules[proc][job]
                 second_job = _self.proc_schedules[proc][job+1]
                 assert first_job.end <= second_job.start, \
                 f"Jobs on a particular processor must finish before the next can begin, but job {first_job.task} on processor {first_job.proc} ends at {first_job.end} and its successor {second_job.task} starts at {second_job.start}"
-    
+    # dict_output 任务id: （处理器，在此处理器上的第几个任务，上一个任务）
     dict_output = {}
     for proc_num, proc_tasks in _self.proc_schedules.items():
         for idx, task in enumerate(proc_tasks):
@@ -313,7 +324,7 @@ def _node_can_be_processed(_self, dag, node):
             return False
     return True
 
-def _compute_eft(_self, dag, node, proc):
+def _compute_eft(_self, dag, node, proc, wf_id):
     """
     Computes the EFT of a particular node if it were scheduled on a particular processor
     It does this by first looking at all predecessor tasks of a particular node and determining the earliest time a task would be ready for execution (ready_time)
@@ -342,11 +353,11 @@ def _compute_eft(_self, dag, node, proc):
             if (prev_job.start - computation_time) - ready_time > 0:
                 logger.debug(f"Found an insertion slot before the first job {prev_job} on processor {proc}")
                 job_start = ready_time
-                min_schedule = ScheduleEvent(node, job_start, job_start+computation_time, proc)
+                min_schedule = ScheduleEvent(node, job_start, job_start+computation_time, proc, wf_id)
                 break
         if idx == len(job_list)-1:
             job_start = max(ready_time, prev_job.end)
-            min_schedule = ScheduleEvent(node, job_start, job_start + computation_time, proc)
+            min_schedule = ScheduleEvent(node, job_start, job_start + computation_time, proc, wf_id)
             break
         next_job = job_list[idx+1]
         #Start of next job - computation time == latest we can start in this window
@@ -356,11 +367,11 @@ def _compute_eft(_self, dag, node, proc):
         if (next_job.start - computation_time) - max(ready_time, prev_job.end) >= 0:
             job_start = max(ready_time, prev_job.end)
             logger.debug(f"\tInsertion is feasible. Inserting job with start time {job_start} and end time {job_start + computation_time} into the time slot [{prev_job.end}, {next_job.start}]")
-            min_schedule = ScheduleEvent(node, job_start, job_start + computation_time, proc)
+            min_schedule = ScheduleEvent(node, job_start, job_start + computation_time, proc, wf_id)
             break
     else:
         #For-else loop: the else executes if the for loop exits without break-ing, which in this case means the number of jobs on this processor are 0
-        min_schedule = ScheduleEvent(node, ready_time, ready_time + computation_time, proc)
+        min_schedule = ScheduleEvent(node, ready_time, ready_time + computation_time, proc, wf_id)
     logger.debug(f"\tFor node {node} on processor {proc}, the EFT is {min_schedule}")
     return min_schedule    
 
@@ -410,6 +421,7 @@ def readDagMatrix(dag_file, show_dag=False):
 
     if show_dag:
         nx.draw(dag, pos=nx.nx_pydot.graphviz_layout(dag, prog='dot'), with_labels=True)
+        # nx.draw(dag, with_labels=True)
         plt.show()
 
     return dag
@@ -418,16 +430,16 @@ def generate_argparser():
     parser = argparse.ArgumentParser(description="A tool for finding HEFT schedules for given DAG task graphs")
     parser.add_argument("-d", "--dag_file", 
                         help="File containing input DAG to be scheduled. Uses default 10 node dag from Topcuoglu 2002 if none given.", 
-                        type=str, default="test/canonicalgraph_task_connectivity.csv")
+                        type=str, default="test/canonicalgraph_task_connectivity_my_1.csv")
     parser.add_argument("-p", "--pe_connectivity_file", 
                         help="File containing connectivity/bandwidth information about PEs. Uses a default 3x3 matrix from Topcuoglu 2002 if none given. If communication startup costs (L) are needed, a \"Startup\" row can be used as the last CSV row", 
-                        type=str, default="test/canonicalgraph_resource_BW.csv")
+                        type=str, default="test/canonicalgraph_resource_BW_my_1.csv")
     parser.add_argument("-t", "--task_execution_file", 
                         help="File containing execution times of each task on each particular PE. Uses a default 10x3 matrix from Topcuoglu 2002 if none given.", 
-                        type=str, default="test/canonicalgraph_task_exe_time.csv")
+                        type=str, default="test/canonicalgraph_task_exe_time_my_1.csv")
     parser.add_argument("-l", "--loglevel", 
                         help="The log level to be used in this module. Default: INFO", 
-                        type=str, default="INFO", dest="loglevel", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
+                        type=str, default="DEBUG", dest="loglevel", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
     parser.add_argument("--metric",
                         help="Specify which metric to use when performing upward rank calculation",
                         type=RankMetric, default=RankMetric.MEAN, dest="rank_metric", choices=list(RankMetric))
@@ -452,21 +464,43 @@ if __name__ == "__main__":
 
     # 读取处理器连通矩阵
     communication_matrix = readCsvToNumpyMatrix(args.pe_connectivity_file)
-    # 任务处理时间矩阵
-    computation_matrix = readCsvToNumpyMatrix(args.task_execution_file)
-    # 读取DAG图
-    dag = readDagMatrix(args.dag_file, args.showDAG) 
-
     # 处理器启动开销，设置为0
     if (communication_matrix.shape[0] != communication_matrix.shape[1]):
         assert communication_matrix.shape[0]-1 == communication_matrix.shape[1], "If the communication_matrix CSV is non-square, there must only be a single additional row specifying the communication startup costs of each PE"
         logger.debug("Non-square communication matrix parsed. Stripping off the last row as communication startup costs")
         communication_startup = communication_matrix[-1, :]
         communication_matrix = communication_matrix[0:-1, :]
-    else:
+    else: 
         communication_startup = np.zeros(communication_matrix.shape[0])
-    # 开始调度
-    processor_schedules, _, _ = schedule_dag(dag, communication_matrix=communication_matrix, communication_startup=communication_startup, computation_matrix=computation_matrix, rank_metric=args.rank_metric)
+
+    computation_matrix = []
+    dag = []
+    processor_schedules = None
+    computation_matrix_path = "test/canonicalgraph_task_exe_time_my_"
+    dag_path = "test/canonicalgraph_task_connectivity_my_"
+    for i in range(0, 3):
+        computation_matrix_path_temp = computation_matrix_path + str(i) + ".csv"
+        dag_path_temp = dag_path + str(i) + ".csv"
+        # 任务处理时间矩阵
+        # computation_matrix = readCsvToNumpyMatrix(args.task_execution_file)
+        computation_matrix_temp = readCsvToNumpyMatrix(computation_matrix_path_temp)
+        # 读取DAG图
+        # dag = readDagMatrix(args.dag_file, args.showDAG) 
+        dag_temp = readDagMatrix(dag_path_temp, args.showDAG)
+        
+        # 添加一列，表示任务编号
+        tasks_num = computation_matrix_temp.shape[0]
+        new_col = []
+        for c in range(0, tasks_num):
+            new_col.append(float(str(int(i)) + "." + str(int(c))))
+        computation_matrix_temp = np.insert(computation_matrix_temp, computation_matrix_temp.shape[1], values = new_col, axis = 1)
+
+        computation_matrix.append(computation_matrix_temp)
+        dag.append(dag_temp)
+
+        # 开始调度
+        processor_schedules, _, _ = schedule_dag(dag_temp, communication_matrix=communication_matrix, communication_startup=communication_startup, proc_schedules=processor_schedules, computation_matrix=computation_matrix_temp, rank_metric=args.rank_metric)
+
     for proc, jobs in processor_schedules.items():
         logger.info(f"Processor {proc} has the following jobs:")
         logger.info(f"\t{jobs}")
