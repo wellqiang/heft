@@ -15,7 +15,8 @@ import networkx as nx
 logger = logging.getLogger('heft')
 
 ScheduleEvent = namedtuple('ScheduleEvent', 'task start end proc wf_id')
-
+Workflows = namedtuple('Workflows', 'dag computation_matrix comp comm id')
+Node_sequence = namedtuple('Node_sequence', 'wf_id node_id')
 """
 Default computation matrix - taken from Topcuoglu 2002 HEFT paper
 computation matrix: v x q matrix with v tasks and q PEs
@@ -61,6 +62,23 @@ class OpMode(Enum):
     EDP_REL = "EDP RELATIVE"
     EDP_ABS = "EDP ABSOLUTE"
     ENERGY = "ENERGY"
+
+class Strategies(Enum):
+    S_COMP = "S_COMP"
+    L_COMP = "L_COMP"
+    S_COMM = "S_COMM"
+    L_COMM = "L_COMM"
+    S_RANK = "S_RANK"
+    L_RANK = "L_RANK"
+    LEVEL = "LEVEL"
+    RAND = "RAND"
+    L_SQUE = "L_SQUE"
+    S_SQUE = "S_SQUE"
+    HEFT = "HEFT"
+
+key = None
+reverse = True
+strategies = Strategies.S_RANK
 
 def schedule_dag(dag, computation_matrix=W0, communication_matrix=C0, communication_startup=L0, proc_schedules=None, time_offset=0, relabel_nodes=True, rank_metric=RankMetric.MEAN, **kwargs):
     """
@@ -439,7 +457,7 @@ def generate_argparser():
                         type=str, default="test/canonicalgraph_task_exe_time_my_1.csv")
     parser.add_argument("-l", "--loglevel", 
                         help="The log level to be used in this module. Default: INFO", 
-                        type=str, default="DEBUG", dest="loglevel", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
+                        type=str, default="INFO", dest="loglevel", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
     parser.add_argument("--metric",
                         help="Specify which metric to use when performing upward rank calculation",
                         type=RankMetric, default=RankMetric.MEAN, dest="rank_metric", choices=list(RankMetric))
@@ -451,7 +469,130 @@ def generate_argparser():
                         dest="showGantt", action="store_true")
     return parser
 
+# 求平均计算时间
+def get_average_computation(computation_matrix):
+    total_sum = 0
+    for row in computation_matrix:
+        total_sum += sum(row)
+    return total_sum / (computation_matrix.shape[0] * computation_matrix.shape[1])
+
+# 求平均通信时间
+def get_average_communication(dag):
+    total_communication_cost = 0
+    edges_num = len(dag.edges)
+    for edge in dag.edges:
+        total_communication_cost += dag[edge[0]][edge[1]]['weight']
+    return total_communication_cost / edges_num
+
+
+# 得到所有工作流的调度顺序
+def get_all_nodes_sequence(sorted_workflows, sorted_nodes_arr):
+    nodes_num = 0
+    for item in sorted_nodes_arr:
+        nodes_num += len(item)
+    node_index = np.zeros_like(sorted_workflows)
+    node_sequence = []
+    while len(node_sequence) < nodes_num:
+        for wf_id in sorted_workflows:
+            if node_index[wf_id] >= len(sorted_nodes_arr[wf_id]):
+                continue
+            node_sequence.append(Node_sequence(wf_id, sorted_nodes_arr[wf_id][node_index[wf_id]]))
+            node_index[wf_id] += 1
+    return node_sequence
+
+
+# 多工作流调度
+def schedule_muti_workflows(workflows, sorted_workflows, communication_matrix, communication_startup, rank_metric=RankMetric.MEAN, **kwargs):
+    _self = {
+        'computation_matrix': workflows[0].computation_matrix,
+        'dag': workflows[0].dag,
+        'communication_matrix': communication_matrix,
+        'communication_startup': communication_startup,
+        'task_schedules': {},
+        'proc_schedules': {},
+        'numExistingJobs': 0,
+        'time_offset': 0,
+        'root_node': None
+    }
+    _self = SimpleNamespace(**_self)
+
+    for i in range(_self.numExistingJobs + len(_self.computation_matrix)):
+        _self.task_schedules[i] = None
+    for i in range(len(_self.communication_matrix)):
+        if i not in _self.proc_schedules:
+            _self.proc_schedules[i] = []
+    
+    sorted_nodes_arr = []
+    for iter in workflows:
+        workflow = workflows[iter]
+        _self.computation_matrix = workflow.computation_matrix
+        # Nodes with no successors cause the any expression to be empty  
+        # 找到entry node  
+        root_node = [node for node in workflow.dag.nodes() if not any(True for _ in workflow.dag.predecessors(node))] # 没有任何前驱节点
+        assert len(root_node) == 1, f"Expected a single root node, found {len(root_node)}"
+        root_node = root_node[0]
+        _self.root_node = root_node
+        # 计算每个DAG中子任务的rankU
+        _compute_ranku(_self, workflow.dag, metric=rank_metric, **kwargs)
+        weight = workflow.dag.nodes()[0]['ranku']
+        #为每个DAG内部的子任务排序
+        sorted_nodes = sorted(workflow.dag.nodes(), key=lambda node: workflow.dag.nodes()[node]['ranku'], reverse=True)
+        # if sorted_nodes[0] != root_node:
+        #     logger.debug("Root node was not the first node in the sorted list. Must be a zero-cost and zero-weight placeholder node. Rearranging it so it is scheduled first\n")
+        #     idx = sorted_nodes.index(root_node)
+        #     sorted_nodes[idx], sorted_nodes[0] = sorted_nodes[0], sorted_nodes[idx]
+        sorted_nodes_arr.append(sorted_nodes)
+
+    # 如果是按照ranku进行排序的话，需要在此得到sorted_workflows数组
+    if strategies == Strategies.L_RANK:
+        key = lambda iter: workflows[iter].dag.nodes()[0]['ranku']
+        reverse = True
+        sorted_workflows = sorted(workflows, key = key, reverse = reverse)
+    elif strategies == Strategies.S_RANK:
+        key = lambda iter: workflows[iter].dag.nodes()[0]['ranku']
+        reverse = False
+        sorted_workflows = sorted(workflows, key = key, reverse = reverse)
+    
+    sequence = get_all_nodes_sequence(sorted_workflows, sorted_nodes_arr)
+    
+    # 按照顺序为每个node分配处理器
+    for pair in sequence:
+        node = pair.node_id
+        wf_id = pair.wf_id
+
+        _self.computation_matrix = workflows[wf_id].computation_matrix
+        _self.dag = workflows[wf_id].dag
+
+        # if _self.task_schedules[node] is not None:
+        #     continue
+        minTaskSchedule = ScheduleEvent(node, inf, inf, -1, 0)
+        minEDP = inf
+        # op_mode = kwargs.get("op_mode", OpMode.EFT)
+
+        for proc in range(len(_self.communication_matrix)):
+            taskschedule = _compute_eft(_self, _self.dag, node, proc, wf_id)
+            if (taskschedule.end < minTaskSchedule.end):
+                minTaskSchedule = taskschedule
+        
+        # 为节点分配最优处理器
+        _self.task_schedules[node] = minTaskSchedule
+        # 相应处理器的相应时间段被占用
+        _self.proc_schedules[minTaskSchedule.proc].append(minTaskSchedule)
+        # 已经被使用的时间段排序
+        _self.proc_schedules[minTaskSchedule.proc] = sorted(_self.proc_schedules[minTaskSchedule.proc], key=lambda schedule_event: (schedule_event.end, schedule_event.start))
+
+        # 保证相同处理器的前一个任务结束时间大于下一个任务的开始时间
+        for proc in range(len(_self.proc_schedules)):
+            for job in range(len(_self.proc_schedules[proc])-1):
+                first_job = _self.proc_schedules[proc][job]
+                second_job = _self.proc_schedules[proc][job+1]
+                assert first_job.end <= second_job.start, \
+                f"Jobs on a particular processor must finish before the next can begin, but job {first_job.task} on processor {first_job.proc} ends at {first_job.end} and its successor {second_job.task} starts at {second_job.start}"
+
+    return _self.proc_schedules, _self.task_schedules
+
 if __name__ == "__main__":
+    workflow_num = 50
     argparser = generate_argparser()
     args = argparser.parse_args()
     
@@ -462,8 +603,11 @@ if __name__ == "__main__":
     consolehandler.setFormatter(logging.Formatter("%(levelname)8s : %(name)16s : %(message)s"))
     logger.addHandler(consolehandler)
 
+    communication_matrix_path = "test/resource_BW.csv"
+    computation_matrix_path = "test/task_exe_time_"
+    dag_path = "test/task_connectivity_"
     # 读取处理器连通矩阵
-    communication_matrix = readCsvToNumpyMatrix(args.pe_connectivity_file)
+    communication_matrix = readCsvToNumpyMatrix(communication_matrix_path)
     # 处理器启动开销，设置为0
     if (communication_matrix.shape[0] != communication_matrix.shape[1]):
         assert communication_matrix.shape[0]-1 == communication_matrix.shape[1], "If the communication_matrix CSV is non-square, there must only be a single additional row specifying the communication startup costs of each PE"
@@ -476,9 +620,8 @@ if __name__ == "__main__":
     computation_matrix = []
     dag = []
     processor_schedules = None
-    computation_matrix_path = "test/canonicalgraph_task_exe_time_my_"
-    dag_path = "test/canonicalgraph_task_connectivity_my_"
-    for i in range(0, 3):
+    workflows = {}
+    for i in range(0, workflow_num):
         computation_matrix_path_temp = computation_matrix_path + str(i) + ".csv"
         dag_path_temp = dag_path + str(i) + ".csv"
         # 任务处理时间矩阵
@@ -488,21 +631,71 @@ if __name__ == "__main__":
         # dag = readDagMatrix(args.dag_file, args.showDAG) 
         dag_temp = readDagMatrix(dag_path_temp, args.showDAG)
         
+        # 求平均计算时间
+        average_computation = get_average_computation(computation_matrix_temp)
+        # 求平均通信时间
+        average_communication = get_average_communication(dag_temp)
+
         # 添加一列，表示任务编号
         tasks_num = computation_matrix_temp.shape[0]
         new_col = []
         for c in range(0, tasks_num):
             new_col.append(float(str(int(i)) + "." + str(int(c))))
-        computation_matrix_temp = np.insert(computation_matrix_temp, computation_matrix_temp.shape[1], values = new_col, axis = 1)
+        # computation_matrix_temp = np.insert(computation_matrix_temp, computation_matrix_temp.shape[1], values = new_col, axis = 1)
 
-        computation_matrix.append(computation_matrix_temp)
-        dag.append(dag_temp)
+        workflows_cur = Workflows(dag_temp, computation_matrix_temp, average_computation, average_communication, i)
+        
+        workflows[workflows_cur.id] = workflows_cur
 
+        # computation_matrix.append(computation_matrix_temp)
+        # dag.append(dag_temp)
+    strategies_list = [
+        Strategies.S_COMP,
+        Strategies.L_COMP,
+        Strategies.S_COMM,
+        Strategies.L_COMM,
+        Strategies.S_RANK,
+        Strategies.L_RANK,
+        Strategies.S_SQUE,
+        Strategies.L_SQUE
+    ]
+    for strategies in strategies_list:
+        if strategies == Strategies.L_COMP:
+            key = lambda iter: workflows[iter].comp
+            reverse = True
+            
+        elif strategies == Strategies.S_COMP:
+            key = lambda iter: workflows[iter].comp
+            reverse = False
+
+        elif strategies == Strategies.L_COMM:
+            key = lambda iter: workflows[iter].comm
+            reverse = True
+
+        elif strategies == Strategies.S_COMM:
+            key = lambda iter: workflows[iter].comm
+            reverse = False
+
+        elif strategies == Strategies.L_SQUE:
+            key = lambda iter: workflows[iter].id
+            reverse = True
+
+        elif strategies == Strategies.S_SQUE:
+            key = lambda iter: workflows[iter].id
+            reverse = False
+
+        # 求得工作流的调度顺序
+        sorted_workflows = sorted(workflows, key = key, reverse=reverse)
+        processor_schedules, _ = schedule_muti_workflows(workflows = workflows, sorted_workflows = sorted_workflows, communication_matrix = communication_matrix, communication_startup=communication_startup)
+    
         # 开始调度
-        processor_schedules, _, _ = schedule_dag(dag_temp, communication_matrix=communication_matrix, communication_startup=communication_startup, proc_schedules=processor_schedules, computation_matrix=computation_matrix_temp, rank_metric=args.rank_metric)
-
-    for proc, jobs in processor_schedules.items():
-        logger.info(f"Processor {proc} has the following jobs:")
-        logger.info(f"\t{jobs}")
-    if args.showGantt:
-        showGanttChart(processor_schedules)
+        # processor_schedules, _, _ = schedule_dag(dag, communication_matrix=communication_matrix, communication_startup=communication_startup, proc_schedules=processor_schedules, computation_matrix=computation_matrix, rank_metric=args.rank_metric)
+        total_endtime = 0
+        for proc, jobs in processor_schedules.items():
+            # logger.info(f"Processor {proc} has the following jobs:")
+            # logger.info(f"\t{jobs}")
+            if total_endtime < jobs[-1].end:
+                total_endtime = jobs[-1].end
+        if args.showGantt:
+            showGanttChart(processor_schedules)
+        logger.info(f"\n************************{strategies}  The end time is:{total_endtime}**********************\n")
