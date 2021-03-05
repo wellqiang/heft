@@ -592,7 +592,7 @@ def schedule_muti_workflows(workflows, sorted_workflows, communication_matrix, c
     return _self.proc_schedules, _self.task_schedules
 
 if __name__ == "__main__":
-    workflow_num = 50
+    workflow_num = 3
     argparser = generate_argparser()
     args = argparser.parse_args()
     
@@ -603,9 +603,9 @@ if __name__ == "__main__":
     consolehandler.setFormatter(logging.Formatter("%(levelname)8s : %(name)16s : %(message)s"))
     logger.addHandler(consolehandler)
 
-    communication_matrix_path = "test/resource_BW.csv"
-    computation_matrix_path = "test/task_exe_time_"
-    dag_path = "test/task_connectivity_"
+    communication_matrix_path = "test/resource_BW.csv" #处理器之间的通信速度
+    computation_matrix_path = "test/task_exe_time_" #每个任务在每个处理器上的处理时间
+    dag_path = "test/task_connectivity_" #任务的DAG图
     # 读取处理器连通矩阵
     communication_matrix = readCsvToNumpyMatrix(communication_matrix_path)
     # 处理器启动开销，设置为0

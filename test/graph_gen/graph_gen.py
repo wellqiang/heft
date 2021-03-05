@@ -29,7 +29,7 @@ def split_number(number, parts):
                 	print("sampling error")
 	return count_per_part
 
-for my_iter in range(0, 50):
+for my_iter in range(0, 100):
 	resource_count = 3
 	graph_height = 6
 	vertex_count = 20
